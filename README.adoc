@@ -1,0 +1,195 @@
+= A Camel Quarkus demo transfering Chuck Norris jokes from icndb.com to Twitter
+
+Export your Twitter credentials:
+
+[source,shell]
+----
+export TWITTER_CONSUMER_KEY=...
+export TWITTER_CONSUMER_SECRET=...
+export TWITTER_ACCESS_TOKEN=...
+export TWITTER_ACCESS_TOKEN_SECRET=...
+export TWITTER_USER_NAME=...
+----
+
+Build in the `dev` mode:
+
+[source,shell]
+----
+mvn clean compile quarkus:dev
+----
+
+Point your browser to http://localhost:8080/cnorris
+
+And live-edit the `Routes.java` file.
+
+
+== Bonus: run the same demo with Camel K
+
+=== Prepare a new Minikube cluster
+
+[source,shell]
+----
+minikube config set driver kvm2
+minikube config set memory 12288
+minikube config set cpus 6
+minikube -p kn start
+minikube -p kn addons enable registry
+----
+
+=== Start the Minikube LoadBalancer in a new terminal
+
+[source,shell]
+----
+minikube -p kn tunnel
+----
+
+=== Install Knative
+
+[source,shell]
+----
+export KNATIVE_VERSION="0.21.0"
+kubectl apply --filename "https://github.com/knative/serving/releases/download/v$KNATIVE_VERSION/serving-crds.yaml"
+kubectl apply --filename "https://github.com/knative/serving/releases/download/v$KNATIVE_VERSION/serving-core.yaml"
+kubectl wait deployment --all --timeout=-1s --for=condition=Available -n knative-serving
+
+kubectl apply --filename https://github.com/knative/net-istio/releases/download/v$KNATIVE_VERSION/istio.yaml
+kubectl apply --filename https://github.com/knative/net-istio/releases/download/v$KNATIVE_VERSION/net-istio.yaml
+kubectl --namespace istio-system get service istio-ingressgateway
+
+# Magic DNS (xip.io)
+kubectl apply --filename https://github.com/knative/serving/releases/download/v$KNATIVE_VERSION/serving-default-domain.yaml
+
+kubectl wait deployment --all --timeout=-1s --for=condition=Available -n knative-serving
+----
+
+=== Prepare a new namespace for the demo
+
+[source,shell]
+----
+kubectl create namespace cnorris
+kubectl config set-context --current --namespace=cnorris
+# install the Camel K operator in the namespace
+kamel install
+kubectl wait deployment --all --timeout=-1s --for=condition=Available
+----
+
+=== Prepare the secret
+
+This assumes that you have your Twitter credentials set in the environment variables as described above
+
+[source,shell]
+----
+mkdir -p target
+# Replace the env vars in application.properties by their values
+sed -e 's|{{env:|${|g' src/main/resources/application.properties | sed -e 's|}}|}|g' | sed '/^#/d' | envsubst > target/application.properties
+# Use the expanded application.properties file to create the kubernetes secret
+kubectl create secret generic cnorris-secret --from-file=target/application.properties
+kubectl describe secret cnorris-secret
+rm target/application.properties
+----
+
+=== Run the integration
+
+[source,shell]
+----
+kamel run Routes.java --dev
+
+# get the application URL
+echo "$(kubectl get routes.serving.knative.dev routes -o jsonpath='{.status.url}')/cnorris"
+----
+
+
+=== Scale to zero
+
+Knative configuration needs a couple of tweaks to be able to observe the scaling fast enough for a demo:
+
+[source,shell]
+----
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+data:
+  container-concurrency-target-default: "2"
+  container-concurrency-target-percentage: "0.7"
+  enable-scale-to-zero: "true"
+  requests-per-second-target-default: "2"
+  scale-to-zero-grace-period: 10s
+  scale-to-zero-pod-retention-period: 0s
+  stable-window: 10s
+kind: ConfigMap
+metadata:
+  annotations:
+  labels:
+    serving.knative.dev/release: v0.21.0
+  name: config-autoscaler
+  namespace: knative-serving
+EOF
+----
+
+Having configured Knative you can start watching the pods the demo namespace.
+
+As long as you have not hit the `/cnorris` endpoint, there should be no pods running except for the Camel K Operator:
+
+[source,shell]
+----
+watch kubectl get pod
+
+NAME                                READY   STATUS    RESTARTS   AGE
+camel-k-operator-6998f57bc6-t88t4   1/1     Running   3          42h
+----
+
+Once you hit the endpoint in browser, or via
+
+[source,shell]
+----
+curl "$(kubectl get routes.serving.knative.dev routes -o jsonpath='{.status.url}')/cnorris"
+----
+
+one more pod should appear:
+
+[source,shell]
+----
+watch kubectl get pod
+
+NAME                                       READY   STATUS    RESTARTS   AGE
+camel-k-operator-6998f57bc6-t88t4          1/1     Running   3          42h
+routes-00002-deployment-67c96964f9-d99w6   1/2     Running   0          7s
+----
+
+If you do not do anything for 10+ seconds, the pod gets decommissioned:
+
+[source,shell]
+----
+watch kubectl get pod
+
+NAME                                       READY   STATUS        RESTARTS   AGE
+camel-k-operator-6998f57bc6-t88t4          1/1     Running       3          43h
+routes-00002-deployment-67c96964f9-d99w6   0/2     Terminating   0          90s
+----
+
+=== Auto-scale up/down
+
+If you produce some more load, e.g. using https://github.com/rakyll/hey#installation[hey]
+
+[source,shell]
+----
+hey -c 12 -z 5s "$(kubectl get routes.serving.knative.dev routes -o jsonpath='{.status.url}')/cnorris"
+----
+
+you should see more pods being spawn to handle the load:
+
+[source,shell]
+----
+watch kubectl get pod
+
+NAME                                       READY   STATUSE   RESTARTS   AGE
+camel-k-operator-6998f57bc6-t88t4          1/1     Running   3          43h
+routes-00002-deployment-67c96964f9-2z7mj   1/2     Running   0          5s
+routes-00002-deployment-67c96964f9-6fhfj   1/2     Running   0          5s
+routes-00002-deployment-67c96964f9-n575l   1/2     Running   0          5s
+routes-00002-deployment-67c96964f9-n6jm7   1/2     Running   0          3s
+routes-00002-deployment-67c96964f9-p75ss   1/2     Running   0          5s
+routes-00002-deployment-67c96964f9-pvw7w   1/2     Running   0          6s
+routes-00002-deployment-67c96964f9-s9677   1/2     Running   0          5s
+routes-00002-deployment-67c96964f9-shkcs   1/2     Running   0          5s
+routes-00002-deployment-67c96964f9-tqpnd   1/2     Running   0          5s
+----
